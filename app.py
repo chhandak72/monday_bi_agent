@@ -3,7 +3,6 @@ import requests
 import pandas as pd
 import os
 from dotenv import load_dotenv
-from openai import OpenAI
 
 # ----------------------------
 # CONFIG
@@ -14,17 +13,17 @@ load_dotenv()
 MONDAY_API_KEY = os.getenv("MONDAY_API_KEY")
 DEALS_BOARD_ID = os.getenv("DEALS_BOARD_ID")
 WORK_ORDERS_BOARD_ID = os.getenv("WORK_ORDERS_BOARD_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+HF_API_KEY = os.getenv("HF_API_KEY")
 
+HF_MODEL = "mistralai/Mistral-7B-Instruct-v0.1"
 MONDAY_URL = "https://api.monday.com/v2"
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 st.set_page_config(page_title="Monday BI Agent", layout="wide")
 st.title("📊 Monday.com Business Intelligence Agent")
 st.markdown("Founder-level AI business intelligence across Sales & Operations")
 
 # ----------------------------
-# FETCH BOARD
+# FETCH BOARD DATA
 # ----------------------------
 
 def fetch_board(board_id):
@@ -66,7 +65,7 @@ def fetch_board(board_id):
     return pd.DataFrame(rows)
 
 # ----------------------------
-# SAFE COLUMN DETECTION
+# UTILITIES
 # ----------------------------
 
 def find_column(df, keywords):
@@ -76,9 +75,6 @@ def find_column(df, keywords):
                 return col
     return None
 
-# ----------------------------
-# CLEANING
-# ----------------------------
 
 def clean_numeric_columns(df):
     for col in df.columns:
@@ -93,7 +89,7 @@ def clean_numeric_columns(df):
 def calculate_pipeline(df):
 
     status_col = find_column(df, ["deal status", "status"])
-    value_col = find_column(df, ["deal value", "masked deal value", "value"])
+    value_col = find_column(df, ["value", "amount"])
     prob_col = find_column(df, ["probability"])
 
     if not status_col or not value_col:
@@ -101,9 +97,7 @@ def calculate_pipeline(df):
 
     open_deals = df[df[status_col] != "Closed Won"]
 
-    total_pipeline = pd.to_numeric(
-        open_deals[value_col], errors="coerce"
-    ).sum()
+    total_pipeline = pd.to_numeric(open_deals[value_col], errors="coerce").sum()
 
     if prob_col:
         weighted_pipeline = (
@@ -119,7 +113,7 @@ def calculate_pipeline(df):
 def revenue_by_sector(df):
 
     status_col = find_column(df, ["deal status", "status"])
-    value_col = find_column(df, ["deal value", "masked deal value", "value"])
+    value_col = find_column(df, ["value", "amount"])
     sector_col = find_column(df, ["sector"])
 
     if not status_col or not value_col:
@@ -143,7 +137,6 @@ def revenue_by_sector(df):
 def work_order_metrics(df):
 
     status_col = find_column(df, ["status"])
-
     total_orders = len(df)
 
     if not status_col:
@@ -166,7 +159,6 @@ def build_dashboard(deals_df, work_df):
     st.subheader("📈 Executive Dashboard")
 
     pipeline, weighted = calculate_pipeline(deals_df)
-
     revenue = revenue_by_sector(deals_df).sum()
 
     total_orders, completed, in_progress, delayed = work_order_metrics(work_df)
@@ -183,75 +175,80 @@ def build_dashboard(deals_df, work_df):
         st.subheader("Revenue by Sector")
         st.bar_chart(sector_data)
 
-    status_col = find_column(work_df, ["status"])
-    if status_col:
-        st.subheader("Work Order Status Distribution")
-        st.bar_chart(work_df[status_col].value_counts())
-
-    st.subheader("⚠ Data Quality Overview")
-
-    missing_values = deals_df.isna().mean() * 100
-    for col, pct in missing_values.items():
-        if pct > 20:
-            st.write(f"- {pct:.1f}% missing in '{col}'")
-
 # ----------------------------
-# LEADERSHIP SUMMARY
-# ----------------------------
-
-def generate_leadership_summary(deals_df, work_df):
-
-    pipeline, weighted = calculate_pipeline(deals_df)
-    revenue = revenue_by_sector(deals_df).sum()
-
-    total_orders, completed, in_progress, delayed = work_order_metrics(work_df)
-
-    return f"""
-### 📊 Leadership Summary
-
-**Sales**
-- Total Pipeline: ₹{pipeline:,.0f}
-- Weighted Forecast: ₹{weighted:,.0f}
-- Closed Revenue: ₹{revenue:,.0f}
-
-**Operations**
-- Total Work Orders: {total_orders}
-- Completed: {completed}
-- In Progress: {in_progress}
-- Delayed: {delayed}
-
----
-
-### Recommendations
-- Improve probability tracking for better forecasting
-- Focus on late-stage deal conversion
-- Investigate delayed work orders
-"""
-
-# ----------------------------
-# QUERY INTERPRETER
+# HUGGINGFACE INTELLIGENCE
 # ----------------------------
 
 def interpret_query(query):
 
+    if not HF_API_KEY:
+        return rule_based_intent(query)
+
+    headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
     prompt = f"""
-    Classify this query into:
-    - pipeline
-    - revenue
-    - operations
-    - leadership
-    - sector
-    - general
+    Classify this business query into one word only:
+    pipeline, revenue, operations, leadership, sector, general
 
     Query: {query}
     """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 10,
+            "temperature": 0.1
+        }
+    }
 
-    return response.choices[0].message.content.lower()
+    try:
+        response = requests.post(
+            f"https://api-inference.huggingface.co/models/{HF_MODEL}",
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            return rule_based_intent(query)
+
+        result = response.json()
+
+        if isinstance(result, list) and "generated_text" in result[0]:
+            output = result[0]["generated_text"].lower()
+            for intent in ["pipeline", "revenue", "operations", "leadership", "sector"]:
+                if intent in output:
+                    return intent
+
+    except:
+        return rule_based_intent(query)
+
+    return "general"
+
+
+# ----------------------------
+# FALLBACK RULE ENGINE
+# ----------------------------
+
+def rule_based_intent(query):
+
+    q = query.lower()
+
+    if "pipeline" in q or "forecast" in q:
+        return "pipeline"
+    elif "revenue" in q:
+        return "revenue"
+    elif "operation" in q or "work order" in q:
+        return "operations"
+    elif "leadership" in q or "summary" in q:
+        return "leadership"
+    elif "sector" in q:
+        return "sector"
+    else:
+        return "general"
 
 # ----------------------------
 # MAIN FLOW
@@ -261,8 +258,7 @@ try:
     with st.spinner("Fetching live data from monday.com..."):
         deals_df = clean_numeric_columns(fetch_board(DEALS_BOARD_ID))
         work_df = clean_numeric_columns(fetch_board(WORK_ORDERS_BOARD_ID))
-
-except Exception as e:
+except Exception:
     st.error("⚠ Unable to fetch monday.com data.")
     st.stop()
 
@@ -276,29 +272,37 @@ with tab2:
     query = st.text_input("Ask a business question:")
 
     if query:
-
         intent = interpret_query(query)
 
-        if "pipeline" in intent:
+        if intent == "pipeline":
             pipeline, weighted = calculate_pipeline(deals_df)
             st.metric("Total Pipeline", f"₹{pipeline:,.0f}")
             st.metric("Weighted Forecast", f"₹{weighted:,.0f}")
 
-        elif "revenue" in intent:
+        elif intent == "revenue":
             revenue = revenue_by_sector(deals_df).sum()
             st.metric("Closed Revenue", f"₹{revenue:,.0f}")
 
-        elif "operations" in intent:
+        elif intent == "operations":
             total_orders, completed, in_progress, delayed = work_order_metrics(work_df)
             st.write(f"Total Orders: {total_orders}")
             st.write(f"Completed: {completed}")
             st.write(f"In Progress: {in_progress}")
             st.write(f"Delayed: {delayed}")
 
-        elif "leadership" in intent:
-            st.markdown(generate_leadership_summary(deals_df, work_df))
+        elif intent == "leadership":
+            st.markdown("### 📊 Leadership Summary")
+            pipeline, weighted = calculate_pipeline(deals_df)
+            revenue = revenue_by_sector(deals_df).sum()
+            total_orders, completed, in_progress, delayed = work_order_metrics(work_df)
 
-        elif "sector" in intent:
+            st.write(f"Pipeline: ₹{pipeline:,.0f}")
+            st.write(f"Forecast: ₹{weighted:,.0f}")
+            st.write(f"Revenue: ₹{revenue:,.0f}")
+            st.write(f"Work Orders: {total_orders}")
+            st.write(f"Delayed: {delayed}")
+
+        elif intent == "sector":
             st.bar_chart(revenue_by_sector(deals_df))
 
         else:
