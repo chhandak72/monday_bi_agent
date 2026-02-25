@@ -24,7 +24,7 @@ st.title("📊 Monday.com Business Intelligence Agent")
 st.markdown("Founder-level AI business intelligence across Sales & Operations")
 
 # ----------------------------
-# FETCH BOARD DATA
+# FETCH BOARD
 # ----------------------------
 
 def fetch_board(board_id):
@@ -66,42 +66,24 @@ def fetch_board(board_id):
     return pd.DataFrame(rows)
 
 # ----------------------------
+# SAFE COLUMN DETECTION
+# ----------------------------
+
+def find_column(df, keywords):
+    for keyword in keywords:
+        for col in df.columns:
+            if keyword.lower() in col.lower():
+                return col
+    return None
+
+# ----------------------------
 # CLEANING
 # ----------------------------
 
-def clean_deals(df):
-
-    df = df.replace("", None)
-
-    if "Masked Deal value" in df.columns:
-        df["Masked Deal value"] = pd.to_numeric(
-            df["Masked Deal value"], errors="coerce"
-        )
-
-    if "Closure Probability Numeric" in df.columns:
-        df["Closure Probability Numeric"] = pd.to_numeric(
-            df["Closure Probability Numeric"], errors="coerce"
-        )
-
-    if "Sector/service" in df.columns:
-        df["Sector/service"] = (
-            df["Sector/service"]
-            .astype(str)
-            .str.lower()
-            .str.strip()
-        )
-
-    return df
-
-
-def clean_work_orders(df):
-
-    df = df.replace("", None)
-
+def clean_numeric_columns(df):
     for col in df.columns:
-        if "amount" in col.lower():
+        if any(word in col.lower() for word in ["value", "amount", "probability"]):
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     return df
 
 # ----------------------------
@@ -109,26 +91,50 @@ def clean_work_orders(df):
 # ----------------------------
 
 def calculate_pipeline(df):
-    open_deals = df[df["Deal Status"] != "Closed Won"]
 
-    total_pipeline = open_deals["Masked Deal value"].sum()
+    status_col = find_column(df, ["deal status", "status"])
+    value_col = find_column(df, ["deal value", "masked deal value", "value"])
+    prob_col = find_column(df, ["probability"])
 
-    weighted_pipeline = (
-        open_deals["Masked Deal value"]
-        * open_deals.get("Closure Probability Numeric", 0)
+    if not status_col or not value_col:
+        return 0, 0
+
+    open_deals = df[df[status_col] != "Closed Won"]
+
+    total_pipeline = pd.to_numeric(
+        open_deals[value_col], errors="coerce"
     ).sum()
+
+    if prob_col:
+        weighted_pipeline = (
+            pd.to_numeric(open_deals[value_col], errors="coerce")
+            * pd.to_numeric(open_deals[prob_col], errors="coerce")
+        ).sum()
+    else:
+        weighted_pipeline = total_pipeline
 
     return total_pipeline, weighted_pipeline
 
 
 def revenue_by_sector(df):
-    closed = df[df["Deal Status"] == "Closed Won"]
 
-    return (
-        closed.groupby("Sector/service")["Masked Deal value"]
-        .sum()
-        .sort_values(ascending=False)
-    )
+    status_col = find_column(df, ["deal status", "status"])
+    value_col = find_column(df, ["deal value", "masked deal value", "value"])
+    sector_col = find_column(df, ["sector"])
+
+    if not status_col or not value_col:
+        return pd.Series()
+
+    closed = df[df[status_col] == "Closed Won"]
+
+    if sector_col:
+        return (
+            closed.groupby(sector_col)[value_col]
+            .apply(lambda x: pd.to_numeric(x, errors="coerce").sum())
+            .sort_values(ascending=False)
+        )
+
+    return pd.Series()
 
 # ----------------------------
 # OPERATIONS LOGIC
@@ -136,12 +142,14 @@ def revenue_by_sector(df):
 
 def work_order_metrics(df):
 
+    status_col = find_column(df, ["status"])
+
     total_orders = len(df)
 
-    status_counts = (
-        df["Status"].value_counts()
-        if "Status" in df.columns else {}
-    )
+    if not status_col:
+        return total_orders, 0, 0, 0
+
+    status_counts = df[status_col].value_counts()
 
     completed = status_counts.get("Completed", 0)
     in_progress = status_counts.get("In Progress", 0)
@@ -159,43 +167,33 @@ def build_dashboard(deals_df, work_df):
 
     pipeline, weighted = calculate_pipeline(deals_df)
 
-    closed = deals_df[deals_df["Deal Status"] == "Closed Won"]
-    revenue = closed["Masked Deal value"].sum()
+    revenue = revenue_by_sector(deals_df).sum()
 
     total_orders, completed, in_progress, delayed = work_order_metrics(work_df)
 
     col1, col2, col3, col4 = st.columns(4)
 
     col1.metric("Total Pipeline", f"₹{pipeline:,.0f}")
-    col2.metric("Weighted Pipeline", f"₹{weighted:,.0f}")
+    col2.metric("Weighted Forecast", f"₹{weighted:,.0f}")
     col3.metric("Closed Revenue", f"₹{revenue:,.0f}")
     col4.metric("Work Orders", total_orders)
 
-    # Revenue by sector
     sector_data = revenue_by_sector(deals_df)
     if not sector_data.empty:
         st.subheader("Revenue by Sector")
         st.bar_chart(sector_data)
 
-    # Work order status
-    if "Status" in work_df.columns:
+    status_col = find_column(work_df, ["status"])
+    if status_col:
         st.subheader("Work Order Status Distribution")
-        st.bar_chart(work_df["Status"].value_counts())
+        st.bar_chart(work_df[status_col].value_counts())
 
     st.subheader("⚠ Data Quality Overview")
 
-    missing_prob = (
-        deals_df["Closure Probability Numeric"].isna().mean() * 100
-        if "Closure Probability Numeric" in deals_df.columns else 0
-    )
-
-    missing_value = (
-        deals_df["Masked Deal value"].isna().mean() * 100
-        if "Masked Deal value" in deals_df.columns else 0
-    )
-
-    st.write(f"- {missing_prob:.1f}% deals missing probability")
-    st.write(f"- {missing_value:.1f}% deals missing deal value")
+    missing_values = deals_df.isna().mean() * 100
+    for col, pct in missing_values.items():
+        if pct > 20:
+            st.write(f"- {pct:.1f}% missing in '{col}'")
 
 # ----------------------------
 # LEADERSHIP SUMMARY
@@ -204,9 +202,7 @@ def build_dashboard(deals_df, work_df):
 def generate_leadership_summary(deals_df, work_df):
 
     pipeline, weighted = calculate_pipeline(deals_df)
-    revenue = deals_df[
-        deals_df["Deal Status"] == "Closed Won"
-    ]["Masked Deal value"].sum()
+    revenue = revenue_by_sector(deals_df).sum()
 
     total_orders, completed, in_progress, delayed = work_order_metrics(work_df)
 
@@ -227,7 +223,7 @@ def generate_leadership_summary(deals_df, work_df):
 ---
 
 ### Recommendations
-- Improve probability capture for better forecasting
+- Improve probability tracking for better forecasting
 - Focus on late-stage deal conversion
 - Investigate delayed work orders
 """
@@ -263,10 +259,10 @@ def interpret_query(query):
 
 try:
     with st.spinner("Fetching live data from monday.com..."):
-        deals_df = clean_deals(fetch_board(DEALS_BOARD_ID))
-        work_df = clean_work_orders(fetch_board(WORK_ORDERS_BOARD_ID))
+        deals_df = clean_numeric_columns(fetch_board(DEALS_BOARD_ID))
+        work_df = clean_numeric_columns(fetch_board(WORK_ORDERS_BOARD_ID))
 
-except Exception:
+except Exception as e:
     st.error("⚠ Unable to fetch monday.com data.")
     st.stop()
 
@@ -289,9 +285,7 @@ with tab2:
             st.metric("Weighted Forecast", f"₹{weighted:,.0f}")
 
         elif "revenue" in intent:
-            revenue = deals_df[
-                deals_df["Deal Status"] == "Closed Won"
-            ]["Masked Deal value"].sum()
+            revenue = revenue_by_sector(deals_df).sum()
             st.metric("Closed Revenue", f"₹{revenue:,.0f}")
 
         elif "operations" in intent:
